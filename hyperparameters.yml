@@ -1,0 +1,270 @@
+# Cada bloque es un conjunto de hiperparámetros. Se elige por nombre al lanzar:
+#   python agent.py demonattack_debug --train   (entrenar)
+#   python agent.py demonattack_long             (ver jugar al mejor modelo)
+
+demonattack_debug:              # prueba corta en el portátil: ¿corre todo sin errores?
+  env_id: ALE/DemonAttack-v5
+  replay_memory_size: 10000     # nº máximo de transiciones guardadas
+  mini_batch_size: 32           # transiciones por actualización
+  train_start: 1000             # no entrenar hasta tener esto en memoria
+  epsilon_init: 1.0             # 100 % acciones aleatorias al inicio
+  epsilon_decay: 0.98           # multiplicativo, por episodio (rápido para depurar)
+  epsilon_min: 0.05
+  network_sync_rate: 1000       # pasos entre copias policy -> target
+  train_freq: 4                 # optimizar cada N pasos
+  learning_rate: 0.0001
+  discount_factor: 0.99         # gamma
+  hidden_dim: 256
+  clip_reward: true             # recompensa -> sign(r) en {-1, 0, +1}
+  max_episodes: 20
+  device: cpu
+
+demonattack_long:               # entrenamiento de verdad (horas)
+  env_id: ALE/DemonAttack-v5
+  replay_memory_size: 100000
+  mini_batch_size: 32
+  train_start: 10000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995          # llega a 0.05 tras ~600 episodios
+  epsilon_min: 0.05
+  network_sync_rate: 1000
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 5000
+  device: cpu
+
+demonattack_long2:              # continúa demonattack_long: 5000 episodios más
+  resume_from: demonattack_long # carga runs/demonattack_long_ckpt.pt (red, target, optimizador, pasos)
+  env_id: ALE/DemonAttack-v5
+  replay_memory_size: 100000
+  mini_batch_size: 32
+  train_start: 10000            # la memoria no se guarda: se rellena antes de seguir optimizando
+  epsilon_init: null            # null = seguir con el ε del checkpoint (0.05)
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  network_sync_rate: 1000
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 5000            # episodios de esta ejecución (numeración sigue desde 5000)
+  device: cpu
+
+demonattack_ddqn:               # experimento 1: Double DQN, desde cero, comparar con demonattack_long
+  env_id: ALE/DemonAttack-v5
+  double_dqn: true
+  replay_memory_size: 100000
+  mini_batch_size: 32
+  train_start: 10000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  network_sync_rate: 1000
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 1500
+  device: cpu
+
+demonattack_stack4:             # experimento 2: 4 estados RAM apilados (512 entradas) + evaluación separada
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 4                # entrada = últimos 4 estados RAM -> 512 bytes
+  double_dqn: false             # igual que demonattack_long: solo cambia la entrada
+  eval_every: 50                # cada 50 episodios: 10 partidas con ε=0 sin entrenar
+  eval_episodes: 10
+  replay_memory_size: 100000
+  mini_batch_size: 32
+  train_start: 10000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  network_sync_rate: 1000
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 1500
+  device: cpu
+
+demonattack_stable:             # experimento 3: paquete de estabilidad + perder vida = terminal
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 1                # como demonattack_long (apilar no aportó y es más lento)
+  double_dqn: false
+  life_loss: terminal           # perder una vida = terminal para el objetivo (la partida sigue)
+  loss: huber                   # SmoothL1 en vez de MSE
+  network_sync_rate: 10000      # antes 1000: objetivo más estable (valor del paper de DQN)
+  eval_every: 50
+  eval_episodes: 10
+  replay_memory_size: 100000
+  mini_batch_size: 32
+  train_start: 10000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 1500
+  device: cpu
+
+demonattack_stable2:            # continúa demonattack_stable (desde su checkpoint del episodio 1500)
+  resume_from: demonattack_stable
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 1
+  double_dqn: false
+  life_loss: terminal
+  loss: huber
+  network_sync_rate: 10000
+  eval_every: 50
+  eval_episodes: 10
+  replay_memory_size: 100000
+  mini_batch_size: 32
+  train_start: 10000            # la memoria no se guarda: se rellena antes de seguir optimizando
+  epsilon_init: null            # null = seguir con el ε del checkpoint (0.05)
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 1000            # episodios de esta ejecución: del 1500 al 2500
+  device: cpu
+
+demonattack_stable_stack4:      # experimento 4: stable + 4 estados RAM apilados (ver qué demonio dispara)
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 4                # el movimiento de las balas permite asociarlas a su demonio
+  double_dqn: false
+  life_loss: terminal
+  loss: huber
+  network_sync_rate: 10000
+  eval_every: 50
+  eval_episodes: 10
+  replay_memory_size: 100000
+  mini_batch_size: 32
+  train_start: 10000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 1000            # recortado para que quepa en la clase
+  device: cpu
+
+# ---- Entrenamiento largo en el Ubuntu (Xeon 32 núcleos): stable + 4 estados, 3 semillas + variante lr ----
+
+ss4_long_s1:                  # stable + 4 estados, 10.000 episodios, semilla 1
+  seed: 1
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 4
+  double_dqn: false
+  life_loss: terminal
+  loss: huber
+  network_sync_rate: 10000
+  eval_every: 100
+  eval_episodes: 10
+  snapshot_every: 100
+  replay_memory_size: 500000    # 5x más memoria (64 GB de RAM: ~1 GB por entrenamiento)
+  mini_batch_size: 32
+  train_start: 50000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 10000
+  torch_threads: 1
+  device: cpu
+
+ss4_long_s2:                  # stable + 4 estados, 10.000 episodios, semilla 2
+  seed: 2
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 4
+  double_dqn: false
+  life_loss: terminal
+  loss: huber
+  network_sync_rate: 10000
+  eval_every: 100
+  eval_episodes: 10
+  snapshot_every: 100
+  replay_memory_size: 500000    # 5x más memoria (64 GB de RAM: ~1 GB por entrenamiento)
+  mini_batch_size: 32
+  train_start: 50000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 10000
+  torch_threads: 1
+  device: cpu
+
+ss4_long_s3:                  # stable + 4 estados, 10.000 episodios, semilla 3
+  seed: 3
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 4
+  double_dqn: false
+  life_loss: terminal
+  loss: huber
+  network_sync_rate: 10000
+  eval_every: 100
+  eval_episodes: 10
+  snapshot_every: 100
+  replay_memory_size: 500000    # 5x más memoria (64 GB de RAM: ~1 GB por entrenamiento)
+  mini_batch_size: 32
+  train_start: 50000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  train_freq: 4
+  learning_rate: 0.0001
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 10000
+  torch_threads: 1
+  device: cpu
+
+ss4_long_lr5e5:                # igual, tasa de aprendizaje a la mitad (¿menos olvido?)
+  seed: 1
+  env_id: ALE/DemonAttack-v5
+  frame_stack: 4
+  double_dqn: false
+  life_loss: terminal
+  loss: huber
+  network_sync_rate: 10000
+  eval_every: 100
+  eval_episodes: 10
+  snapshot_every: 100
+  replay_memory_size: 500000    # 5x más memoria (64 GB de RAM: ~1 GB por entrenamiento)
+  mini_batch_size: 32
+  train_start: 50000
+  epsilon_init: 1.0
+  epsilon_decay: 0.995
+  epsilon_min: 0.05
+  train_freq: 4
+  learning_rate: 0.00005
+  discount_factor: 0.99
+  hidden_dim: 256
+  clip_reward: true
+  max_episodes: 10000
+  torch_threads: 1
+  device: cpu

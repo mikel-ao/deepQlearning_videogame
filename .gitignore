@@ -1,0 +1,7 @@
+runs/
+__pycache__/
+*.pt
+*.mp4
+.DS_Store
+DQN PyTorch - Flappy Bird.pdf
+Hoja de ruta DQN.html
