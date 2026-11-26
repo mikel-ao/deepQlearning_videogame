@@ -7,10 +7,10 @@ Uso (desde la carpeta del proyecto, con dql activado):
     python eval_snapshots.py demonattack_stack4 --every 50 --games 20        # todos (≈ 10 min)
 
 Salida:
-    runs/<set>_snapshot_eval.csv          episodio, media, desviación, min, mediana, max
-    runs/<set>_best_confirmed.pt          el snapshot con mejor media
+    runs/<set>_snapshot_eval[_eps<ε>]_g<partidas>.csv     episodio, media, desviación, min, mediana, max
+    runs/<set>_best_confirmed[_eps<ε>]_g<partidas>.pt     el snapshot con mejor media
 Para verlo jugar:
-    python agent.py <set> --model runs/<set>_best_confirmed.pt
+    python agent.py <set> --model runs/<set>_best_confirmed_g30.pt
 """
 import argparse
 import random
