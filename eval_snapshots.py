@@ -7,8 +7,8 @@ Uso (desde la carpeta del proyecto, con dql activado):
     python eval_snapshots.py demonattack_stack4 --every 50 --games 20        # todos (≈ 10 min)
 
 Salida:
-    runs/<set>_snapshot_eval[_eps<ε>]_g<partidas>.csv     episodio, media, desviación, min, mediana, max
-    runs/<set>_best_confirmed[_eps<ε>]_g<partidas>.pt     el snapshot con mejor media
+    runs/<set>_snapshot_eval[_eps<ε>]_g<partidas>.csv   episodio, media, desviación, min, mediana, max
+    runs/<set>_best_confirmed[_eps<ε>]_g<partidas>.pt    el snapshot con mejor media
 Para verlo jugar:
     python agent.py <set> --model runs/<set>_best_confirmed_g30.pt
 """
@@ -31,18 +31,19 @@ from dqn import DQN
 torch.set_num_threads(1)          # no robar CPU a un entrenamiento que esté en marcha
 
 
-def play(net, env, games, seed0, epsilon=0.0):
+def play(net, env, games, seed0, epsilon=0.0, actions=None):
+    """actions: lista de acciones del juego si el modelo usa action_set (p. ej. [1, 4, 5])."""
     scores = []
     for g in range(games):
         state, _ = env.reset(seed=seed0 + g)          # mismas semillas para todos los snapshots
         done, score = False, 0.0
         while not done:
             if random.random() < epsilon:                  # ε de evaluación (el paper de DQN usa 0.05)
-                action = env.action_space.sample()
+                action = random.randrange(len(actions)) if actions else env.action_space.sample()
             else:
                 with torch.no_grad():
                     action = net(torch.as_tensor(state).unsqueeze(0)).argmax(dim=1).item()
-            state, reward, terminated, truncated, _ = env.step(action)
+            state, reward, terminated, truncated, _ = env.step(actions[action] if actions else action)
             score += reward
             done = terminated or truncated
         scores.append(score)
@@ -76,7 +77,8 @@ def main():
         raise SystemExit(f"No hay snapshots en {snap_dir}")
 
     env = make_env(hp["env_id"], hp.get("frame_stack", 1))
-    net = DQN(env.observation_space.shape[0], env.action_space.n, hp["hidden_dim"])
+    actions = hp.get("action_set")
+    net = DQN(env.observation_space.shape[0], len(actions) if actions else env.action_space.n, hp["hidden_dim"])
     net.eval()
 
     random.seed(args.seed)
@@ -86,25 +88,37 @@ def main():
     for ep in sorted(snaps):
         t0 = time.time()
         net.load_state_dict(torch.load(snaps[ep], map_location="cpu"))
-        s = play(net, env, args.games, args.seed, args.epsilon)
+        s = play(net, env, args.games, args.seed, args.epsilon, actions)
         rows.append([ep, s.mean(), s.std(), s.min(), np.median(s), s.max()])
         print(f"{ep:8d} | {s.mean():7.1f} | {s.std():6.1f} | {s.min():5.0f} | {np.median(s):7.0f} | {s.max():5.0f} | {time.time() - t0:4.0f}s")
     env.close()
 
-    # el nombre incluye ε y nº de partidas: evaluaciones distintas no se sobrescriben
+    # el nombre incluye ε y nº de partidas; el CSV ACUMULA: evaluar otros episodios añade filas
+    # (si un episodio ya estaba, se actualiza) -> nunca se pierde una evaluación anterior
     tag = ("" if args.epsilon == 0 else f"_eps{args.epsilon:g}") + f"_g{args.games}"
     out = os.path.join("runs", f"{args.hyperparameters}_snapshot_eval{tag}.csv")
+    merged = {}
+    if os.path.exists(out):
+        with open(out) as f:
+            for row in csv.DictReader(f):
+                e = int(row["episodio"])
+                merged[e] = [e] + [float(row[k]) for k in ("media", "desv", "min", "mediana", "max")]
+    for r in rows:
+        merged[r[0]] = r
+    rows = [merged[e] for e in sorted(merged)]
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["episodio", "media", "desv", "min", "mediana", "max", "partidas"])
         for r in rows:
             w.writerow([r[0]] + [round(x, 1) for x in r[1:]] + [args.games])
 
+    rows = [r for r in rows if r[0] in snaps or os.path.exists(os.path.join(snap_dir, f"ep_{r[0]:05d}.pt"))]
     best = max(rows, key=lambda r: r[1])
+    snaps.setdefault(best[0], os.path.join(snap_dir, f"ep_{best[0]:05d}.pt"))
     best_path = os.path.join("runs", f"{args.hyperparameters}_best_confirmed{tag}.pt")
     shutil.copy(snaps[best[0]], best_path)
     sem = best[2] / np.sqrt(args.games)
-    print(f"\nMejor: episodio {best[0]} con media {best[1]:.1f} ± {sem:.1f} (error estándar, {args.games} partidas)")
+    print(f"\nMejor de todas las evaluadas ({len(rows)} snapshots): episodio {best[0]} con media {best[1]:.1f} ± {sem:.1f} (error estándar, {args.games} partidas)")
     print(f"Tabla: {out}\nModelo: {best_path}")
 
 

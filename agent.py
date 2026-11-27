@@ -5,8 +5,10 @@ Entrenar:            python agent.py demonattack_long --train
 Ver jugar (prueba):  python agent.py demonattack_long
 """
 import argparse
+import glob
 import itertools
 import os
+import pickle
 import random
 import time
 from datetime import datetime
@@ -42,6 +44,25 @@ def make_env(env_id, frame_stack=1, render_mode=None):
         env = gym.wrappers.FrameStackObservation(env, stack_size=frame_stack)   # (N, 128)
         env = gym.wrappers.FlattenObservation(env)                              # (N*128,)
     return env
+
+
+# acciones con disparo equivalentes (para usar demostraciones con action_set de 3 acciones)
+FIRE_VERSION = {0: 1, 2: 4, 3: 5}          # NOOP->FIRE, RIGHT->RIGHTFIRE, LEFT->LEFTFIRE
+
+
+def restore_emulator(env, state_bytes):
+    """Pone el emulador en un estado grabado (record_human.py) y rehace la pila de estados RAM."""
+    ale = env.unwrapped.ale
+    ale.restoreState(pickle.loads(state_bytes))
+    ram = ale.getRAM().copy()
+    w = env
+    while w is not None and not isinstance(w, gym.wrappers.FrameStackObservation):
+        w = getattr(w, "env", None)
+    if w is None:
+        return ram, ale.lives()
+    for _ in range(w.stack_size):
+        w.obs_queue.append(ram)
+    return np.concatenate([ram] * w.stack_size), ale.lives()
 
 
 class Agent:
@@ -80,6 +101,15 @@ class Agent:
         self.loss_name = hp.get("loss", "mse")          # mse | huber
         assert self.life_loss in ("none", "terminal", "terminal_penalty"), self.life_loss
 
+        # ---- tanda 3 (todas opcionales; sin ellas el agente es idéntico al de antes) ----
+        self.action_set = hp.get("action_set")          # p. ej. [1, 4, 5] = FIRE, RIGHTFIRE, LEFTFIRE
+        self.demo_glob = hp.get("demo_glob")            # p. ej. "demos/demo_*.npz"
+        self.demo_ratio = hp.get("demo_ratio", 0.25)    # fracción de cada mini-batch sacada de tus partidas
+        self.demo_margin = hp.get("demo_margin", 0.0)   # peso de la pérdida de margen de DQfD (0 = no)
+        self.demo_start_prob = hp.get("demo_start_prob", 0.0)    # prob. de empezar un episodio en un estado tuyo
+        self.demo_start_min_score = hp.get("demo_start_min_score", 0)  # solo estados con >= puntos (oleadas avanzadas)
+        self.init_model = hp.get("init_model")          # .pt con el que inicializar la red
+
         # 2.8: Huber (SmoothL1) es menos sensible a errores grandes -> entrenamiento más estable
         self.loss_fn = nn.SmoothL1Loss() if self.loss_name == "huber" else nn.MSELoss()
         self.optimizer = None                           # se crea en run()
@@ -104,7 +134,8 @@ class Agent:
             random.seed(self.seed); np.random.seed(self.seed); torch.manual_seed(self.seed)
             env.reset(seed=self.seed); env.action_space.seed(self.seed)
         num_states = env.observation_space.shape[0]
-        num_actions = env.action_space.n
+        self.actions = list(self.action_set) if self.action_set else list(range(env.action_space.n))
+        num_actions = len(self.actions)                  # la red da un valor por acción PERMITIDA
 
         policy_dqn = DQN(num_states, num_actions, self.hidden_dim).to(self.device)
 
@@ -112,8 +143,12 @@ class Agent:
             memory = ReplayMemory(self.replay_memory_size)
             epsilon = self.epsilon_init
 
+            if self.init_model:
+                policy_dqn.load_state_dict(torch.load(self.init_model, map_location=self.device))
             target_dqn = DQN(num_states, num_actions, self.hidden_dim).to(self.device)
             target_dqn.load_state_dict(policy_dqn.state_dict())          # 2.6
+            self.demos = self.load_demos(num_states) if self.demo_glob else None
+            self.start_states = self.load_start_states() if self.demo_start_prob > 0 else []
             self.optimizer = torch.optim.Adam(policy_dqn.parameters(), lr=self.learning_rate)
 
             rewards_per_episode, epsilon_history = [], []
@@ -147,19 +182,24 @@ class Agent:
         for episode in itertools.count(start_episode):                  # 1.10
             state, info = env.reset()
             lives = info.get("lives")
+            demo_start = False
+            if is_training and self.start_states and random.random() < self.demo_start_prob:
+                state, lives = restore_emulator(env, random.choice(self.start_states))
+                demo_start = True
             terminated = truncated = False
             episode_reward, ep_steps, t0 = 0.0, 0, time.time()
 
             while not (terminated or truncated):
                 # ---- 2.1 ε-greedy (sin forward si explora) -------------------
                 if is_training and random.random() < epsilon:
-                    action = env.action_space.sample()
+                    action = (random.randrange(num_actions) if self.action_set   # índice dentro de self.actions
+                              else env.action_space.sample())
                 else:
                     with torch.no_grad():                                # 2.3
                         s = torch.as_tensor(state, device=self.device).unsqueeze(0)
                         action = policy_dqn(s).argmax(dim=1).item()
 
-                new_state, reward, terminated, truncated, info = env.step(action)
+                new_state, reward, terminated, truncated, info = env.step(self.actions[action])
                 episode_reward += reward
                 ep_steps += 1
 
@@ -197,14 +237,19 @@ class Agent:
                 continue
 
             # ---- fin de episodio: ε, registro, guardado -----------------------
-            rewards_per_episode.append(episode_reward)
             epsilon = max(epsilon * self.epsilon_decay, self.epsilon_min)    # 2.2
-            epsilon_history.append(epsilon)
+            if demo_start:          # empezó a mitad de partida: no cuenta para media100 (no sería comparable)
+                self.log(f"ep {episode:5d} | r={episode_reward:6.0f} | [desde estado tuyo] | ε={epsilon:.3f}"
+                         f" | pasos={step_count}")
+            else:
+                rewards_per_episode.append(episode_reward)
+                epsilon_history.append(epsilon)
 
-            avg = np.mean(rewards_per_episode[-AVG_WINDOW:])
+            avg = np.mean(rewards_per_episode[-AVG_WINDOW:]) if rewards_per_episode else 0.0
             sps = ep_steps / max(time.time() - t0, 1e-9)
-            self.log(f"ep {episode:5d} | r={episode_reward:6.0f} | media{AVG_WINDOW}={avg:7.1f}"
-                     f" | ε={epsilon:.3f} | pasos={step_count} | {sps:,.0f} pasos/s")
+            if not demo_start:
+                self.log(f"ep {episode:5d} | r={episode_reward:6.0f} | media{AVG_WINDOW}={avg:7.1f}"
+                         f" | ε={epsilon:.3f} | pasos={step_count} | {sps:,.0f} pasos/s")
 
             if self.eval_every:
                 # evaluación separada: red congelada, ε=0, sin entrenar -> métrica estable
@@ -256,7 +301,7 @@ class Agent:
                 with torch.no_grad():
                     s = torch.as_tensor(state, device=self.device).unsqueeze(0)
                     action = policy_dqn(s).argmax(dim=1).item()
-                state, reward, terminated, truncated, _ = env.step(action)
+                state, reward, terminated, truncated, _ = env.step(self.actions[action])
                 score += reward
                 done = terminated or truncated
             scores.append(score)
@@ -265,9 +310,24 @@ class Agent:
     # ------------------------------------------------------------------ 3.x
     def optimize(self, mini_batch, policy_dqn, target_dqn):
         states, actions, new_states, rewards, terminations = zip(*mini_batch)   # 3.4
+        states, new_states = np.stack(states), np.stack(new_states)
+        actions, rewards, terminations = np.array(actions), np.array(rewards), np.array(terminations)
 
-        states = torch.as_tensor(np.stack(states), device=self.device)
-        new_states = torch.as_tensor(np.stack(new_states), device=self.device)
+        n_demo = 0
+        if self.demos is not None:
+            # una parte del mini-batch sale de tus partidas (se quedan para siempre, no se sobrescriben)
+            n_demo = max(1, int(round(self.mini_batch_size * self.demo_ratio)))
+            keep = self.mini_batch_size - n_demo
+            d = self.demos
+            idx = np.random.randint(len(d["actions"]), size=n_demo)
+            states = np.concatenate([states[:keep], d["states"][idx]])
+            new_states = np.concatenate([new_states[:keep], d["next_states"][idx]])
+            actions = np.concatenate([actions[:keep], d["actions"][idx]])
+            rewards = np.concatenate([rewards[:keep], d["rewards"][idx]])
+            terminations = np.concatenate([terminations[:keep], d["dones"][idx]])
+
+        states = torch.as_tensor(states, device=self.device)
+        new_states = torch.as_tensor(new_states, device=self.device)
         actions = torch.as_tensor(actions, dtype=torch.long, device=self.device)
         rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         terminations = torch.as_tensor(terminations, dtype=torch.float32, device=self.device)
@@ -281,13 +341,68 @@ class Agent:
                 next_q = target_dqn(new_states).max(dim=1)[0]
             target_q = rewards + (1 - terminations) * self.discount_factor * next_q
 
-        current_q = policy_dqn(states).gather(1, actions.unsqueeze(1)).squeeze(1)  # 3.6
+        all_q = policy_dqn(states)
+        current_q = all_q.gather(1, actions.unsqueeze(1)).squeeze(1)  # 3.6
         assert current_q.shape == target_q.shape                                   # trampa (32,1) vs (32,)
 
         loss = self.loss_fn(current_q, target_q)
+        if n_demo and self.demo_margin > 0:
+            # pérdida de margen (DQfD): tu acción debe valer al menos 0.8 más que cualquier otra
+            q_d, a_d = all_q[-n_demo:], actions[-n_demo:]
+            margins = torch.full_like(q_d, 0.8)
+            margins.scatter_(1, a_d.unsqueeze(1), 0.0)
+            j_e = ((q_d + margins).max(dim=1)[0] - q_d.gather(1, a_d.unsqueeze(1)).squeeze(1)).mean()
+            loss = loss + self.demo_margin * j_e
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+    # ------------------------------------------------------------------ demostraciones
+    def _action_index(self, a):
+        """Acción del juego (0-5) -> índice dentro de self.actions, o None si no está permitida."""
+        if a in self.actions:
+            return self.actions.index(a)
+        if FIRE_VERSION.get(a) in self.actions:          # sin disparo -> su versión con disparo
+            return self.actions.index(FIRE_VERSION[a])
+        return None
+
+    def load_demos(self, num_states):
+        S, S2, A, R, D = [], [], [], [], []
+        files = sorted(glob.glob(self.demo_glob))
+        for f in files:
+            d = np.load(f, allow_pickle=True)
+            if d["states"].shape[1] != num_states:
+                self.log(f"  (demo {f} descartada: frame_stack distinto)")
+                continue
+            idx = np.array([self._action_index(int(a)) for a in d["actions"]], dtype=object)
+            ok = np.array([i is not None for i in idx])
+            r = d["rewards"].astype(np.float32)
+            r = np.sign(r) if self.clip_reward else r
+            done = d["terminated"].copy()
+            if self.life_loss != "none":                      # misma regla que el agente
+                done = done | d["life_lost"]
+                if self.life_loss == "terminal_penalty":
+                    r = r - d["life_lost"].astype(np.float32)
+            S.append(d["states"][ok]); S2.append(d["next_states"][ok]); A.append(idx[ok].astype(np.int64))
+            R.append(r[ok]); D.append(done[ok].astype(np.float32))
+        if not S:
+            raise SystemExit(f"No hay demostraciones válidas en {self.demo_glob}")
+        demos = {"states": np.concatenate(S), "next_states": np.concatenate(S2), "actions": np.concatenate(A),
+                 "rewards": np.concatenate(R), "dones": np.concatenate(D)}
+        self.log(f"Demostraciones: {len(demos['actions'])} transiciones de {len(files)} archivos,"
+                 f" {self.demo_ratio:.0%} de cada mini-batch, margen={self.demo_margin}")
+        return demos
+
+    def load_start_states(self):
+        states = []
+        for f in sorted(glob.glob(self.demo_glob or "demos/demo_*.npz")):
+            d = np.load(f, allow_pickle=True)
+            if "emu_states" not in d.files:
+                continue
+            states += [e[5] for e in d["emu_states"] if e[3] >= self.demo_start_min_score]
+        self.log(f"Estados de inicio: {len(states)} (puntos >= {self.demo_start_min_score}),"
+                 f" prob={self.demo_start_prob}")
+        return states
 
     def save_graph(self, rewards, epsilons, evals=()):
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))

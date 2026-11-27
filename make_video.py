@@ -65,7 +65,9 @@ def annotate(frame, episode, score, step, max_steps, font):
 
 def play_clip(model_path, episode, hp, max_steps, seed, writer, font, device="cpu"):
     env = make_env(hp["env_id"], hp.get("frame_stack", 1), render_mode="rgb_array")
-    net = DQN(env.observation_space.shape[0], env.action_space.n, hp["hidden_dim"]).to(device)
+    actions = hp.get("action_set")
+    net = DQN(env.observation_space.shape[0], len(actions) if actions else env.action_space.n,
+              hp["hidden_dim"]).to(device)
     net.load_state_dict(torch.load(model_path, map_location=device))
     net.eval()
 
@@ -74,7 +76,7 @@ def play_clip(model_path, episode, hp, max_steps, seed, writer, font, device="cp
     while not done and step < max_steps:
         with torch.no_grad():
             action = net(torch.as_tensor(state, device=device).unsqueeze(0)).argmax(dim=1).item()
-        state, reward, terminated, truncated, _ = env.step(action)
+        state, reward, terminated, truncated, _ = env.step(actions[action] if actions else action)
         score += reward
         step += 1
         done = terminated or truncated
