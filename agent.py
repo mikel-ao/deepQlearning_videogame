@@ -48,6 +48,7 @@ def make_env(env_id, frame_stack=1, render_mode=None):
 
 # acciones con disparo equivalentes (para usar demostraciones con action_set de 3 acciones)
 FIRE_VERSION = {0: 1, 2: 4, 3: 5}          # NOOP->FIRE, RIGHT->RIGHTFIRE, LEFT->LEFTFIRE
+PLAYER_X_RAM, WALL_VALUES = 22, (17, 200)  # byte 22 = 17 pegado a la izquierda, 200 pegado a la derecha
 
 
 def restore_emulator(env, state_bytes):
@@ -109,6 +110,8 @@ class Agent:
         self.demo_start_prob = hp.get("demo_start_prob", 0.0)    # prob. de empezar un episodio en un estado tuyo
         self.demo_start_min_score = hp.get("demo_start_min_score", 0)  # solo estados con >= puntos (oleadas avanzadas)
         self.init_model = hp.get("init_model")          # .pt con el que inicializar la red
+        self.corner_penalty = hp.get("corner_penalty", 0.0)   # castigo por paso pegado a una pared...
+        self.corner_patience = hp.get("corner_patience", 30)  # ...a partir de N pasos seguidos (30 = 2 s)
 
         # 2.8: Huber (SmoothL1) es menos sensible a errores grandes -> entrenamiento más estable
         self.loss_fn = nn.SmoothL1Loss() if self.loss_name == "huber" else nn.MSELoss()
@@ -188,6 +191,7 @@ class Agent:
                 demo_start = True
             terminated = truncated = False
             episode_reward, ep_steps, t0 = 0.0, 0, time.time()
+            wall_run, wall_steps = 0, 0                    # pasos seguidos / totales pegado a una pared
 
             while not (terminated or truncated):
                 # ---- 2.1 ε-greedy (sin forward si explora) -------------------
@@ -202,6 +206,9 @@ class Agent:
                 new_state, reward, terminated, truncated, info = env.step(self.actions[action])
                 episode_reward += reward
                 ep_steps += 1
+                at_wall = env.unwrapped.ale.getRAM()[PLAYER_X_RAM] in WALL_VALUES
+                wall_run = wall_run + 1 if at_wall else 0
+                wall_steps += at_wall
 
                 if is_training:
                     r = float(np.sign(reward)) if self.clip_reward else float(reward)
@@ -209,6 +216,9 @@ class Agent:
                     # ---- perder una vida: terminal SOLO para el aprendizaje ----------
                     # la partida sigue; el objetivo deja de contar con el futuro tras morir,
                     # así morir cuesta exactamente el valor futuro que se pierde
+                    if self.corner_penalty and wall_run > self.corner_patience:
+                        r -= self.corner_penalty                 # escondido en una esquina: castigo pequeño por paso
+
                     lost_life = lives is not None and info.get("lives", lives) < lives
                     lives = info.get("lives", lives)
                     done_for_learning = terminated
@@ -249,7 +259,8 @@ class Agent:
             sps = ep_steps / max(time.time() - t0, 1e-9)
             if not demo_start:
                 self.log(f"ep {episode:5d} | r={episode_reward:6.0f} | media{AVG_WINDOW}={avg:7.1f}"
-                         f" | ε={epsilon:.3f} | pasos={step_count} | {sps:,.0f} pasos/s")
+                         f" | ε={epsilon:.3f} | pasos={step_count} | {sps:,.0f} pasos/s"
+                         f" | pared {wall_steps / max(ep_steps, 1):.0%}")
 
             if self.eval_every:
                 # evaluación separada: red congelada, ε=0, sin entrenar -> métrica estable
