@@ -5,7 +5,7 @@
 set -e
 cd "$(dirname "$0")"
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1
-RUNS="ss4_long_s1 ss4_long_s2 ss4_long_s3 ss4_long_lr5e5"
+RUNS="ss4_long_s1 ss4_long_s2 ss4_long_s3 ss4_long_s4 ss4_long_lr5e5 ss4_long_ddqn_s1"
 tmux new-session -d -s dqn -n info "echo 'Entrenamientos: $RUNS'; bash"
 for r in $RUNS; do
   tmux new-window -t dqn -n "$r" "conda run --no-capture-output -n dql python agent.py $r --train; bash"
