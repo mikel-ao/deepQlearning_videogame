@@ -5,6 +5,7 @@ Entrenar:            python agent.py demonattack_long --train
 Ver jugar (prueba):  python agent.py demonattack_long
 """
 import argparse
+import collections
 import glob
 import itertools
 import os
@@ -21,7 +22,7 @@ import torch
 import yaml
 from torch import nn
 
-from dqn import DQN
+from dqn import build_dqn
 from experience_replay import ReplayMemory
 
 matplotlib.use("Agg")          # dibujar a archivo, sin ventana
@@ -113,6 +114,18 @@ class Agent:
         self.corner_penalty = hp.get("corner_penalty", 0.0)   # castigo por paso pegado a una pared...
         self.corner_patience = hp.get("corner_patience", 30)  # ...a partir de N pasos seguidos (30 = 2 s)
 
+        # ---- tanda 4: estabilidad (todas opcionales; sin ellas, el agente de siempre) ----
+        self.grad_clip = hp.get("grad_clip")            # norma máxima del gradiente (p. ej. 10)
+        self.target_tau = hp.get("target_tau")          # red objetivo suave: θ' <- τθ + (1-τ)θ' en cada actualización
+        self.n_step = hp.get("n_step", 1)               # retornos de n pasos
+        self.dueling = hp.get("dueling", False)         # Dueling DQN
+        self.munchausen = hp.get("munchausen", False)   # Munchausen-DQN (objetivo suave regularizado por entropía)
+        self.m_alpha = hp.get("m_alpha", 0.9)
+        self.m_tau = hp.get("m_tau", 0.03)
+        self.m_l0 = hp.get("m_l0", -1.0)
+        self.lr_end = hp.get("lr_end")                  # lr decreciente (exponencial) hasta este valor al final
+        self.clip_stats = [0, 0]                        # actualizaciones / cuántas recortó grad_clip (por episodio)
+
         # 2.8: Huber (SmoothL1) es menos sensible a errores grandes -> entrenamiento más estable
         self.loss_fn = nn.SmoothL1Loss() if self.loss_name == "huber" else nn.MSELoss()
         self.optimizer = None                           # se crea en run()
@@ -140,7 +153,7 @@ class Agent:
         self.actions = list(self.action_set) if self.action_set else list(range(env.action_space.n))
         num_actions = len(self.actions)                  # la red da un valor por acción PERMITIDA
 
-        policy_dqn = DQN(num_states, num_actions, self.hidden_dim).to(self.device)
+        policy_dqn = build_dqn(num_states, num_actions, self.hidden_dim, self.dueling).to(self.device)
 
         if is_training:
             memory = ReplayMemory(self.replay_memory_size)
@@ -148,7 +161,7 @@ class Agent:
 
             if self.init_model:
                 policy_dqn.load_state_dict(torch.load(self.init_model, map_location=self.device))
-            target_dqn = DQN(num_states, num_actions, self.hidden_dim).to(self.device)
+            target_dqn = build_dqn(num_states, num_actions, self.hidden_dim, self.dueling).to(self.device)
             target_dqn.load_state_dict(policy_dqn.state_dict())          # 2.6
             self.demos = self.load_demos(num_states) if self.demo_glob else None
             self.start_states = self.load_start_states() if self.demo_start_prob > 0 else []
@@ -176,6 +189,12 @@ class Agent:
                          f" {step_count} pasos, ε={epsilon:.3f} (la replay memory empieza vacía)")
 
             self.log(f"Inicio entrenamiento '{self.hyperparameter_set}'")
+            extras = {k: v for k, v in dict(grad_clip=self.grad_clip, target_tau=self.target_tau,
+                                           n_step=self.n_step if self.n_step > 1 else None,
+                                           dueling=self.dueling or None, munchausen=self.munchausen or None,
+                                           lr_end=self.lr_end).items() if v}
+            if extras:
+                self.log(f"Opciones de estabilidad: {extras}")
         else:
             start_episode = 0
             policy_dqn.load_state_dict(torch.load(model_file or self.MODEL_FILE, map_location=self.device))
@@ -191,6 +210,12 @@ class Agent:
                 demo_start = True
             terminated = truncated = False
             episode_reward, ep_steps, t0 = 0.0, 0, time.time()
+            nbuf = collections.deque()                     # ventana para los retornos de n pasos
+            if is_training and self.lr_end:
+                frac = min(1.0, (episode - start_episode) / max(self.max_episodes, 1))
+                lr = self.learning_rate * (self.lr_end / self.learning_rate) ** frac
+                for g in self.optimizer.param_groups:
+                    g["lr"] = lr
             wall_run, wall_steps = 0, 0                    # pasos seguidos / totales pegado a una pared
 
             while not (terminated or truncated):
@@ -228,16 +253,27 @@ class Agent:
                             r -= 1.0
 
                     # guardar `terminated` (o pérdida de vida), no `truncated`: truncar no es morir
-                    memory.append((state, action, new_state, r, done_for_learning))
+                    nbuf.append((state, action, r, done_for_learning, new_state))
+                    if done_for_learning or truncated:
+                        while nbuf:                                # vaciar la ventana: no se cruza una muerte
+                            memory.append(self._n_step_transition(nbuf))
+                            nbuf.popleft()
+                    elif len(nbuf) >= self.n_step:
+                        memory.append(self._n_step_transition(nbuf))
+                        nbuf.popleft()
                     step_count += 1
 
                     # ---- 2.7 optimizar cada train_freq pasos ------------------
                     if len(memory) >= self.train_start and step_count % self.train_freq == 0:
                         mini_batch = memory.sample(self.mini_batch_size)
                         self.optimize(mini_batch, policy_dqn, target_dqn)
+                        if self.target_tau:                      # red objetivo suave (Polyak)
+                            with torch.no_grad():
+                                for pt, p in zip(target_dqn.parameters(), policy_dqn.parameters()):
+                                    pt.mul_(1 - self.target_tau).add_(p, alpha=self.target_tau)
 
                     # ---- 2.6 sincronizar red objetivo (por pasos) -------------
-                    if step_count % self.network_sync_rate == 0:
+                    if not self.target_tau and step_count % self.network_sync_rate == 0:
                         target_dqn.load_state_dict(policy_dqn.state_dict())
 
                 state = new_state
@@ -260,7 +296,10 @@ class Agent:
             if not demo_start:
                 self.log(f"ep {episode:5d} | r={episode_reward:6.0f} | media{AVG_WINDOW}={avg:7.1f}"
                          f" | ε={epsilon:.3f} | pasos={step_count} | {sps:,.0f} pasos/s"
-                         f" | pared {wall_steps / max(ep_steps, 1):.0%}")
+                         f" | pared {wall_steps / max(ep_steps, 1):.0%}"
+                         + (f" | recorte {self.clip_stats[1] / max(self.clip_stats[0], 1):.0%}" if self.grad_clip else "")
+                         + (f" | lr {self.optimizer.param_groups[0]['lr']:.1e}" if self.lr_end else ""))
+                self.clip_stats = [0, 0]
 
             if self.eval_every:
                 # evaluación separada: red congelada, ε=0, sin entrenar -> métrica estable
@@ -320,9 +359,10 @@ class Agent:
 
     # ------------------------------------------------------------------ 3.x
     def optimize(self, mini_batch, policy_dqn, target_dqn):
-        states, actions, new_states, rewards, terminations = zip(*mini_batch)   # 3.4
+        states, actions, new_states, rewards, terminations, discounts = zip(*mini_batch)   # 3.4
         states, new_states = np.stack(states), np.stack(new_states)
         actions, rewards, terminations = np.array(actions), np.array(rewards), np.array(terminations)
+        discounts = np.array(discounts, dtype=np.float32)        # γ^n de cada transición (γ si n = 1)
 
         n_demo = 0
         if self.demos is not None:
@@ -336,21 +376,33 @@ class Agent:
             actions = np.concatenate([actions[:keep], d["actions"][idx]])
             rewards = np.concatenate([rewards[:keep], d["rewards"][idx]])
             terminations = np.concatenate([terminations[:keep], d["dones"][idx]])
+            discounts = np.concatenate([discounts[:keep], np.full(n_demo, self.discount_factor, dtype=np.float32)])
 
         states = torch.as_tensor(states, device=self.device)
         new_states = torch.as_tensor(new_states, device=self.device)
         actions = torch.as_tensor(actions, dtype=torch.long, device=self.device)
         rewards = torch.as_tensor(rewards, dtype=torch.float32, device=self.device)
         terminations = torch.as_tensor(terminations, dtype=torch.float32, device=self.device)
+        discounts = torch.as_tensor(discounts, device=self.device)
 
         with torch.no_grad():                                                     # 3.5
-            if self.double_dqn:
+            if self.munchausen:
+                # Munchausen-DQN (Vieillard et al., 2020): objetivo "suave" con la política softmax de la red
+                # objetivo, más un bonus α·τ·log π(a|s) acotado en [l0, 0]
+                q_next = target_dqn(new_states)
+                logpi_next = torch.log_softmax(q_next / self.m_tau, dim=1)
+                next_v = (logpi_next.exp() * (q_next - self.m_tau * logpi_next)).sum(dim=1)
+                logpi = torch.log_softmax(target_dqn(states) / self.m_tau, dim=1).gather(1, actions.unsqueeze(1)).squeeze(1)
+                bonus = self.m_alpha * torch.clamp(self.m_tau * logpi, min=self.m_l0, max=0.0)
+                target_q = rewards + bonus + (1 - terminations) * discounts * next_v
+            elif self.double_dqn:
                 # la red de política ELIGE la mejor acción, la red objetivo la EVALÚA
                 best_actions = policy_dqn(new_states).argmax(dim=1, keepdim=True)
                 next_q = target_dqn(new_states).gather(1, best_actions).squeeze(1)
             else:
                 next_q = target_dqn(new_states).max(dim=1)[0]
-            target_q = rewards + (1 - terminations) * self.discount_factor * next_q
+            if not self.munchausen:
+                target_q = rewards + (1 - terminations) * discounts * next_q
 
         all_q = policy_dqn(states)
         current_q = all_q.gather(1, actions.unsqueeze(1)).squeeze(1)  # 3.6
@@ -366,7 +418,24 @@ class Agent:
             loss = loss + self.demo_margin * j_e
         self.optimizer.zero_grad()
         loss.backward()
+        if self.grad_clip:
+            norm = torch.nn.utils.clip_grad_norm_(policy_dqn.parameters(), self.grad_clip)
+            self.clip_stats[0] += 1
+            self.clip_stats[1] += float(norm) > self.grad_clip
         self.optimizer.step()
+
+    def _n_step_transition(self, nbuf):
+        """Transición de n pasos desde nbuf[0]: suma descontada de recompensas hasta n pasos o una muerte."""
+        state, action = nbuf[0][0], nbuf[0][1]
+        ret, disc = 0.0, 1.0
+        for i, (_, _, r, done, s_next) in enumerate(nbuf):
+            if i >= self.n_step:
+                break
+            ret += disc * r
+            disc *= self.discount_factor
+            if done:
+                return (state, action, s_next, ret, True, disc)
+        return (state, action, s_next, ret, False, disc)
 
     # ------------------------------------------------------------------ demostraciones
     def _action_index(self, a):

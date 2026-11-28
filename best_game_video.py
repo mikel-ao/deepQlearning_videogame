@@ -20,7 +20,7 @@ import torch
 import yaml
 
 from agent import make_env
-from dqn import DQN
+from dqn import build_dqn
 from PIL import Image, ImageDraw
 
 from make_video import BAR_H, SCALE, load_font
@@ -46,7 +46,7 @@ def load(block, model):
         hp = yaml.safe_load(f)[block]
     actions = hp.get("action_set")
     env = make_env(hp["env_id"], hp.get("frame_stack", 1))
-    net = DQN(env.observation_space.shape[0], len(actions) if actions else env.action_space.n, hp["hidden_dim"])
+    net = build_dqn(env.observation_space.shape[0], len(actions) if actions else env.action_space.n, hp["hidden_dim"], hp.get("dueling", False))
     net.load_state_dict(torch.load(model, map_location="cpu"))
     net.eval()
     env.close()

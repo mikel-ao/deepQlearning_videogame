@@ -25,7 +25,7 @@ import yaml
 from PIL import Image, ImageDraw, ImageFont
 
 from agent import make_env
-from dqn import DQN
+from dqn import build_dqn
 
 gym.register_envs(ale_py)
 
@@ -66,8 +66,8 @@ def annotate(frame, episode, score, step, max_steps, font):
 def play_clip(model_path, episode, hp, max_steps, seed, writer, font, device="cpu"):
     env = make_env(hp["env_id"], hp.get("frame_stack", 1), render_mode="rgb_array")
     actions = hp.get("action_set")
-    net = DQN(env.observation_space.shape[0], len(actions) if actions else env.action_space.n,
-              hp["hidden_dim"]).to(device)
+    net = build_dqn(env.observation_space.shape[0], len(actions) if actions else env.action_space.n,
+                    hp["hidden_dim"], hp.get("dueling", False)).to(device)
     net.load_state_dict(torch.load(model_path, map_location=device))
     net.eval()
 

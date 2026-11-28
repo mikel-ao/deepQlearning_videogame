@@ -8,7 +8,8 @@ Para cada grupo junta sus semillas y usa solo los snapshots 200, 400, ..., 3000 
   - escondidos           nº de snapshots que se esconden: partidas de > 15.000 pasos y mediana <= 100
   - pared                % medio del tiempo pegado a una pared
 
-Uso:  python compare_groups.py
+Uso:  python compare_groups.py                                   # tanda 3 frente a la base
+      python compare_groups.py --groups ss4_long b4_clip b4_tau b4_n3 b4_duel b4_mdqn b4_lrdec   # tanda 4
       python compare_groups.py --groups b3_a3 b3_demo ss4_long --max-ep 3000
 """
 import argparse
@@ -29,7 +30,9 @@ p.add_argument("--good", type=float, default=750)
 args = p.parse_args()
 
 NAMES = {"ss4_long": "base (6 acciones)", "b3_a3": "3 acciones", "b3_demo": "+ mis partidas",
-         "b3_dqfd": "+ partidas + margen", "b3_start": "+ partidas + mis estados", "b3_corner": "3 acc. + castigo esquinas"}
+         "b3_dqfd": "+ partidas + margen", "b3_start": "+ partidas + mis estados", "b3_corner": "3 acc. + castigo esquinas",
+         "b4_clip": "gradient clipping", "b4_tau": "red objetivo suave", "b4_n3": "n-step 3",
+         "b4_duel": "dueling", "b4_mdqn": "Munchausen", "b4_lrdec": "lr decreciente"}
 
 
 def load(run):

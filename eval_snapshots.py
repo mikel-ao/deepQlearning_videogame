@@ -26,7 +26,7 @@ import torch
 import yaml
 
 from agent import make_env
-from dqn import DQN
+from dqn import build_dqn
 
 torch.set_num_threads(1)          # no robar CPU a un entrenamiento que esté en marcha
 
@@ -87,7 +87,7 @@ def main():
 
     env = make_env(hp["env_id"], hp.get("frame_stack", 1))
     actions = hp.get("action_set")
-    net = DQN(env.observation_space.shape[0], len(actions) if actions else env.action_space.n, hp["hidden_dim"])
+    net = build_dqn(env.observation_space.shape[0], len(actions) if actions else env.action_space.n, hp["hidden_dim"], hp.get("dueling", False))
     net.eval()
 
     random.seed(args.seed)
