@@ -6,7 +6,6 @@ Uso:  python resumen.py                 -> todos los runs/ss4_long_*.log
       watch -n 60 python resumen.py     -> se refresca cada minuto (Ctrl+c para salir)
 """
 import glob
-import numpy as np
 import os
 import re
 import sys
@@ -37,7 +36,7 @@ for path in sorted(glob.glob(pattern)):
         f"{evals[-1][1]:.0f} (ep {evals[-1][0]})" if evals else "-",
         f"{best_ev[1]:.0f} (ep {best_ev[0]})" if best_ev else "-",
         last.group(6),
-        f"{np.mean(walls[-100:]):.0f}%" if walls else "-",
+        f"{sum(walls[-100:]) / len(walls[-100:]):.0f}%" if walls else "-",
     ))
 
 hdr = ("run", "ep", "media100", "max media100", "ε", "último EVAL", "mejor EVAL", "pasos/s", "pared")

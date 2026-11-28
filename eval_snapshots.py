@@ -31,9 +31,13 @@ from dqn import DQN
 torch.set_num_threads(1)          # no robar CPU a un entrenamiento que esté en marcha
 
 
-def play(net, env, games, seed0, epsilon=0.0, actions=None):
-    """actions: lista de acciones del juego si el modelo usa action_set (p. ej. [1, 4, 5])."""
-    scores = []
+PLAYER_X_RAM, WALL_VALUES = 22, (17, 200)       # byte 22 de la RAM: 17/200 = cañón pegado a la pared
+
+
+def play(net, env, games, seed0, epsilon=0.0, actions=None, stats=None):
+    """actions: lista de acciones del juego si el modelo usa action_set (p. ej. [1, 4, 5]).
+    stats: dict opcional donde se devuelven 'pared' (fracción de pasos pegado a una pared) y 'pasos' (media por partida)."""
+    scores, total_steps, wall_steps = [], 0, 0
     for g in range(games):
         state, _ = env.reset(seed=seed0 + g)          # mismas semillas para todos los snapshots
         done, score = False, 0.0
@@ -45,8 +49,13 @@ def play(net, env, games, seed0, epsilon=0.0, actions=None):
                     action = net(torch.as_tensor(state).unsqueeze(0)).argmax(dim=1).item()
             state, reward, terminated, truncated, _ = env.step(actions[action] if actions else action)
             score += reward
+            total_steps += 1
+            wall_steps += env.unwrapped.ale.getRAM()[PLAYER_X_RAM] in WALL_VALUES
             done = terminated or truncated
         scores.append(score)
+    if stats is not None:
+        stats["pared"] = wall_steps / max(total_steps, 1)
+        stats["pasos"] = total_steps / max(games, 1)
     return np.array(scores)
 
 
@@ -84,13 +93,15 @@ def main():
     random.seed(args.seed)
     rows = []
     print(f"{len(snaps)} snapshots × {args.games} partidas (ε={args.epsilon})\n")
-    print(f"{'episodio':>8} | {'media':>7} | {'desv':>6} | {'min':>5} | {'mediana':>7} | {'max':>5} | t")
+    print(f"{'episodio':>8} | {'media':>7} | {'desv':>6} | {'min':>5} | {'mediana':>7} | {'max':>5} | {'pared':>5} | {'pasos':>6} | t")
     for ep in sorted(snaps):
         t0 = time.time()
         net.load_state_dict(torch.load(snaps[ep], map_location="cpu"))
-        s = play(net, env, args.games, args.seed, args.epsilon, actions)
-        rows.append([ep, s.mean(), s.std(), s.min(), np.median(s), s.max()])
-        print(f"{ep:8d} | {s.mean():7.1f} | {s.std():6.1f} | {s.min():5.0f} | {np.median(s):7.0f} | {s.max():5.0f} | {time.time() - t0:4.0f}s")
+        st = {}
+        s = play(net, env, args.games, args.seed, args.epsilon, actions, stats=st)
+        rows.append([ep, s.mean(), s.std(), s.min(), np.median(s), s.max(), 100 * st["pared"], st["pasos"]])
+        print(f"{ep:8d} | {s.mean():7.1f} | {s.std():6.1f} | {s.min():5.0f} | {np.median(s):7.0f} | {s.max():5.0f}"
+              f" | {100 * st['pared']:4.0f}% | {st['pasos']:6.0f} | {time.time() - t0:4.0f}s")
     env.close()
 
     # el nombre incluye ε y nº de partidas; el CSV ACUMULA: evaluar otros episodios añade filas
@@ -102,15 +113,16 @@ def main():
         with open(out) as f:
             for row in csv.DictReader(f):
                 e = int(row["episodio"])
-                merged[e] = [e] + [float(row[k]) for k in ("media", "desv", "min", "mediana", "max")]
+                merged[e] = [e] + [float(row[k]) for k in ("media", "desv", "min", "mediana", "max")] + \
+                            [float(row[k]) if row.get(k) not in (None, "") else float("nan") for k in ("pared", "pasos")]
     for r in rows:
         merged[r[0]] = r
     rows = [merged[e] for e in sorted(merged)]
     with open(out, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["episodio", "media", "desv", "min", "mediana", "max", "partidas"])
+        w.writerow(["episodio", "media", "desv", "min", "mediana", "max", "pared", "pasos", "partidas"])
         for r in rows:
-            w.writerow([r[0]] + [round(x, 1) for x in r[1:]] + [args.games])
+            w.writerow([r[0]] + ["" if np.isnan(x) else round(x, 1) for x in r[1:]] + [args.games])
 
     rows = [r for r in rows if r[0] in snaps or os.path.exists(os.path.join(snap_dir, f"ep_{r[0]:05d}.pt"))]
     best = max(rows, key=lambda r: r[1])
